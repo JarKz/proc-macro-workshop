@@ -1,8 +1,11 @@
 use proc_macro2::{Delimiter, Group, Ident, Span, TokenStream};
 use quote::{quote, ToTokens};
 use syn::{
-    parse_macro_input, punctuated::Punctuated, token::Comma, AngleBracketedGenericArguments, Data,
-    DeriveInput, Field, Fields, GenericArgument, Path, PathArguments, PathSegment, Type, TypePath,
+    parse_macro_input,
+    punctuated::Punctuated,
+    token::{Comma, Dyn},
+    AngleBracketedGenericArguments, Data, DeriveInput, Field, Fields, GenericArgument, Path,
+    PathArguments, PathSegment, Type, TypeParamBound, TypePath,
 };
 
 #[proc_macro_derive(Builder)]
@@ -79,6 +82,7 @@ impl BuilderCreator {
 
         self.r#struct.fields = modified_fields;
         self.r#struct.create_setters(fields);
+        self.r#struct.create_build(self.source_impl.ident.clone());
     }
 
     fn to_token_stream(&self) -> TokenStream {
@@ -140,6 +144,52 @@ impl Struct {
                 function
             })
             .collect();
+    }
+
+    fn create_build(&mut self, derivable_struct_ident: Ident) {
+        let name = Ident::new("build", Span::call_site());
+        let return_type = new_type(
+            Ident::new("Result", Span::call_site()),
+            vec![
+                new_type(derivable_struct_ident.clone(), vec![]),
+                new_type(
+                    Ident::new("Box", Span::call_site()),
+                    vec![new_dyn_type("std::error::Error")],
+                ),
+            ],
+        );
+        let mut function = Function::new(name, return_type, TypeModifier::None);
+        function.params = Punctuated::from_iter(vec![Param {
+            name: Ident::new("self", Span::call_site()),
+            modifier: TypeModifier::None,
+            r#type: None,
+        }]);
+
+        let struct_body = self
+            .fields
+            .clone()
+            .into_iter()
+            .map(|field| {
+                let ident = field.ident.unwrap();
+                quote!( #ident: self.#ident.unwrap(), )
+            })
+            .reduce(|mut lhs, rhs| {
+                lhs.extend(rhs);
+                lhs
+            });
+
+        function.body = Some(Group::new(
+            Delimiter::Brace,
+            quote! {
+                Ok(
+                    #derivable_struct_ident {
+                        #struct_body
+                    }
+                )
+            },
+        ));
+
+        self.implement.functions.push(function);
     }
 
     fn to_token_stream(&self) -> TokenStream {
@@ -310,5 +360,24 @@ fn new_type(ident: Ident, generics: Vec<Type>) -> Type {
             segments: Punctuated::from_iter(vec![PathSegment { ident, arguments }]),
             leading_colon: None,
         },
+    })
+}
+
+fn new_dyn_type(path: &str) -> Type {
+    let segments = Punctuated::from_iter(path.split("::").map(|part| PathSegment {
+        ident: Ident::new(part, Span::call_site()),
+        arguments: PathArguments::None,
+    }));
+    Type::TraitObject(syn::TypeTraitObject {
+        dyn_token: Some(Dyn(Span::call_site())),
+        bounds: Punctuated::from_iter(vec![TypeParamBound::Trait(syn::TraitBound {
+            paren_token: None,
+            modifier: syn::TraitBoundModifier::None,
+            lifetimes: None,
+            path: Path {
+                leading_colon: None,
+                segments,
+            },
+        })]),
     })
 }
