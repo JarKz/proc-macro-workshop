@@ -70,18 +70,7 @@ impl BuilderCreator {
                 quote!( #ident { #init_fields } )
             }));
 
-        let modified_fields: Punctuated<Field, Comma> = fields
-            .clone()
-            .into_iter()
-            .map(|mut field| {
-                let option = Ident::new("Option", Span::call_site());
-                field.ty = new_type(option, vec![field.ty]);
-                field
-            })
-            .collect();
-
-        self.r#struct.fields = modified_fields;
-        self.r#struct.create_setters(fields);
+        fields.into_iter().for_each(|field| self.r#struct.push_field(field));
         self.r#struct.create_build(self.source_impl.ident.clone());
     }
 
@@ -94,6 +83,7 @@ impl BuilderCreator {
 
 struct Struct {
     ident: Ident,
+    required_fields: Vec<usize>,
     fields: Punctuated<Field, Comma>,
     implement: Implement,
 }
@@ -102,48 +92,58 @@ impl Struct {
     fn new(builder_ident: Ident) -> Self {
         Struct {
             ident: builder_ident.clone(),
+            required_fields: Vec::new(),
             fields: Punctuated::new(),
             implement: Implement::new_empty(builder_ident),
         }
     }
 
-    fn create_setters(&mut self, fields: Punctuated<Field, Comma>) {
-        self.implement.functions = fields
-            .into_iter()
-            .map(|field| {
-                let field_ident = field.ident.unwrap();
-                let r#type = Some(field.ty);
+    fn push_field(&mut self, mut field: Field) {
+        let maybe_generic_type = unwrap_optional(&field.ty);
+        let param_type;
+        if let Some(generic_type) = maybe_generic_type {
+            self.required_fields.push(self.fields.len());
+            param_type = generic_type;
+        } else {
+            param_type = field.ty.clone();
+            let option = Ident::new("Option", Span::call_site());
+            field.ty = new_type(option, vec![field.ty]);
+        }
 
-                let mut function = Function::new(
-                    field_ident.clone(),
-                    new_type(Ident::new("Self", Span::call_site()), vec![]),
-                    TypeModifier::MutableReference,
-                );
+        self.fields.push(field.clone());
+        self.create_setter(field, param_type);
+    }
 
-                function.params = Punctuated::from_iter(vec![
-                    Param {
-                        modifier: TypeModifier::MutableReference,
-                        name: Ident::new("self", Span::call_site()),
-                        r#type: None,
-                    },
-                    Param {
-                        modifier: TypeModifier::None,
-                        name: field_ident.clone(),
-                        r#type,
-                    },
-                ]);
+    fn create_setter(&mut self, field: Field, param_type: Type) {
+        let field_ident = field.ident.unwrap();
+        let mut function = Function::new(
+            field_ident.clone(),
+            new_type(Ident::new("Self", Span::call_site()), vec![]),
+            TypeModifier::MutableReference,
+        );
 
-                function.body = Some(Group::new(
-                    Delimiter::Brace,
-                    quote! {
-                        self.#field_ident = Some(#field_ident);
-                        self
-                    },
-                ));
+        function.params = Punctuated::from_iter(vec![
+            Param {
+                modifier: TypeModifier::MutableReference,
+                name: Ident::new("self", Span::call_site()),
+                r#type: None,
+            },
+            Param {
+                modifier: TypeModifier::None,
+                name: field_ident.clone(),
+                r#type: Some(param_type),
+            },
+        ]);
 
-                function
-            })
-            .collect();
+        function.body = Some(Group::new(
+            Delimiter::Brace,
+            quote! {
+                self.#field_ident = Some(#field_ident);
+                self
+            },
+        ));
+
+        self.implement.functions.push(function);
     }
 
     fn create_build(&mut self, derivable_struct_ident: Ident) {
@@ -169,9 +169,14 @@ impl Struct {
             .fields
             .clone()
             .into_iter()
-            .map(|field| {
+            .enumerate()
+            .map(|(i, field)| {
                 let ident = field.ident.unwrap();
-                quote!( #ident: self.#ident.as_ref().unwrap().to_owned(), )
+                if self.required_fields.contains(&i) {
+                    quote!( #ident: self.#ident.to_owned(), )
+                } else {
+                    quote!( #ident: self.#ident.as_ref().unwrap().to_owned(), )
+                }
             })
             .reduce(|mut lhs, rhs| {
                 lhs.extend(rhs);
@@ -194,19 +199,7 @@ impl Struct {
 
     fn to_token_stream(&self) -> TokenStream {
         let ident = &self.ident;
-        let fields = self
-            .fields
-            .clone()
-            .into_iter()
-            .map(|field| {
-                let ident = field.ident;
-                let r#type = field.ty;
-                quote! ( #ident: #r#type, )
-            })
-            .reduce(|mut lhs, rhs| {
-                lhs.extend(rhs);
-                lhs
-            });
+        let fields = &self.fields;
         let mut tt = quote! {
             struct #ident {
                 #fields
@@ -285,14 +278,6 @@ impl Function {
             return_type,
             body,
         } = self;
-        let params = params
-            .iter()
-            .map(|param| param.to_token_stream())
-            .reduce(|mut lhs, rhs| {
-                lhs.extend(rhs);
-                lhs
-            })
-            .unwrap_or(TokenStream::new());
         let body = body.as_ref().unwrap();
 
         quote! {
@@ -308,8 +293,8 @@ struct Param {
     r#type: Option<Type>,
 }
 
-impl Param {
-    fn to_token_stream(&self) -> TokenStream {
+impl ToTokens for Param {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
         let Param {
             modifier,
             name,
@@ -319,7 +304,7 @@ impl Param {
             .as_ref()
             .map(|r#type| quote!(: #r#type))
             .unwrap_or(TokenStream::new());
-        quote!( #modifier #name #r#type, )
+        tokens.extend(quote!( #modifier #name #r#type ));
     }
 }
 
@@ -339,6 +324,36 @@ impl ToTokens for TypeModifier {
             Self::Mutable => quote!(mut),
             Self::None => TokenStream::new(),
         });
+    }
+}
+
+fn unwrap_optional(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Path(TypePath { path, .. }) => {
+            let segment = path.segments.last().unwrap();
+            let r#type = &segment.ident;
+
+            if r#type.to_string() == "Option".to_string() {
+                match &segment.arguments {
+                    PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                        args, ..
+                    }) => {
+                        if args.len() > 1 {
+                            panic!("Option type have more than one generic types!");
+                        }
+
+                        match args.first().unwrap() {
+                            GenericArgument::Type(ty) => return Some(ty.to_owned()),
+                            _ => panic!("Option type have other items than Type in generics!"),
+                        }
+                    }
+                    _ => panic!("Option type doesn't have an generic type!"),
+                }
+            } else {
+                None
+            }
+        }
+        _ => panic!("Expected path type, given other type! It's like std::option::Option."),
     }
 }
 
