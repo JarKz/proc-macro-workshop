@@ -161,7 +161,7 @@ impl Struct {
         let mut function = Function::new(name, return_type, TypeModifier::None);
         function.params = Punctuated::from_iter(vec![Param {
             name: Ident::new("self", Span::call_site()),
-            modifier: TypeModifier::None,
+            modifier: TypeModifier::MutableReference,
             r#type: None,
         }]);
 
@@ -171,7 +171,7 @@ impl Struct {
             .into_iter()
             .map(|field| {
                 let ident = field.ident.unwrap();
-                quote!( #ident: self.#ident.unwrap(), )
+                quote!( #ident: self.#ident.as_ref().unwrap().to_owned(), )
             })
             .reduce(|mut lhs, rhs| {
                 lhs.extend(rhs);
