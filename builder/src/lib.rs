@@ -77,9 +77,23 @@ impl BuilderCreator {
     }
 
     fn to_token_stream(&self) -> TokenStream {
-        let mut tt = self.r#struct.to_token_stream();
-        tt.extend(self.source_impl.to_token_stream());
-        tt
+        if !self.r#struct.compile_errors.is_empty() {
+            self.r#struct
+                .compile_errors
+                .clone()
+                .into_iter()
+                .reduce(|mut lhs, rhs| {
+                    lhs.combine(rhs);
+                    lhs
+                })
+                .unwrap()
+                .to_compile_error()
+                .into()
+        } else {
+            let mut tt = self.r#struct.to_token_stream();
+            tt.extend(self.source_impl.to_token_stream());
+            tt
+        }
     }
 }
 
@@ -89,6 +103,7 @@ struct Struct {
     fields_with_attr: Vec<usize>,
     fields: Punctuated<Field, Comma>,
     implement: Implement,
+    compile_errors: Vec<syn::Error>,
 }
 
 impl Struct {
@@ -99,11 +114,12 @@ impl Struct {
             fields_with_attr: Vec::new(),
             fields: Punctuated::new(),
             implement: Implement::new_empty(builder_ident),
+            compile_errors: Vec::new(),
         }
     }
 
     fn push_field(&mut self, mut field: Field) {
-        let attr_data = Self::parse_attr_data(&field);
+        let attr_data = self.parse_attr_data(&field);
 
         let maybe_generic_type = unwrap_optional(&field.ty);
         let mut param_type;
@@ -126,18 +142,32 @@ impl Struct {
         self.create_setter(field, param_type, attr_data);
     }
 
-    fn parse_attr_data(field: &Field) -> Option<String> {
+    fn parse_attr_data(&mut self, field: &Field) -> Option<String> {
         if let Some(attr) = field
             .attrs
             .iter()
             .find(|attr| attr.path().is_ident("builder"))
         {
             let data: Expr = attr.parse_args().unwrap();
+            let new_error = |span| syn::Error::new(span, "expected `builder(each = \"...\")`");
+            let error = match &attr.meta {
+                syn::Meta::List(meta_list) => {
+                    syn::Error::new_spanned(meta_list, "expected `builder(each = \"...\")`")
+                    // meta_list.span().join(meta_list.delimiter.span().span()).unwrap()
+                }
+                _ => {
+                    self.compile_errors
+                        .push(new_error(attr.bracket_token.span.join()));
+                    return None;
+                }
+            };
+
             match data {
                 Expr::Assign(assign_expr) => {
                     if let Expr::Path(val) = *assign_expr.left {
                         if !val.path.is_ident("each") {
-                            panic!("Currently only knows 'each' param!")
+                            self.compile_errors.push(error);
+                            return None;
                         }
                     }
 
@@ -147,13 +177,20 @@ impl Struct {
                                 let data = literal.value();
                                 Some(data)
                             }
-                            _ => panic!("Expected string literal, but given other types!"),
+                            _ => {
+                                self.compile_errors.push(error);
+                                None
+                            }
                         }
                     } else {
-                        panic!("Must be a string literal!")
+                        self.compile_errors.push(error);
+                        None
                     }
                 }
-                _ => panic!("Invalid expression in attribute #[builder(...)]!"),
+                _ => {
+                    self.compile_errors.push(error);
+                    None
+                }
             }
         } else {
             None
@@ -448,7 +485,6 @@ fn unwrap_vector(ty: Type) -> Type {
                     }
                     _ => panic!("Vector type doesn't have an generic type!"),
                 }
-
             } else {
                 panic!("The helper attribute is not applicable to this attribute, becuase it is not a Vec<T> or Option<Vec<T>>!");
             }
